@@ -72,116 +72,28 @@ RAW_TEST_DIR = PROJECT_ROOT / "dataset" / "test"
 GROUND_TRUTH_PATH = RAW_TRAIN_DIR / "train_ground_truth.tsv"
 
 
-# ─── Step 0: Normalization (inline, vectorized) ──────────────────────────────
-
-def _vectorized_normalize_names(series: pd.Series) -> pd.Series:
-    """Vectorized business name normalization via pandas string ops."""
-    import re as _re
-
-    src_dir = Path(__file__).resolve().parent
-    if str(src_dir) not in sys.path:
-        sys.path.insert(0, str(src_dir))
-    from normalize import SUFFIX_MAP
-
-    result = series.fillna("").str.lower()
-    result = result.str.replace("&", " and ", regex=False)
-    result = result.str.replace(
-        r"\b(?:[a-z]\.){2,}",
-        lambda m: m.group(0).replace(".", ""),
-        regex=True,
-        case=False,
-    )
-    result = result.str.replace(r"[^\w\s\-]", " ", regex=True)
-    result = result.str.replace(r"\s+", " ", regex=True).str.strip()
-
-    for key in sorted(SUFFIX_MAP.keys(), key=len, reverse=True):
-        pattern = r"(?<!\w)" + _re.escape(key) + r"(?![\w-])"
-        result = result.str.replace(pattern, SUFFIX_MAP[key], regex=True, case=False)
-
-    result = result.str.replace(r"\s+", " ", regex=True).str.strip()
-    return result
-
-
-def _vectorized_normalize_addresses(series: pd.Series) -> pd.Series:
-    """Vectorized address normalization (lightweight)."""
-    import re as _re
-
-    src_dir = Path(__file__).resolve().parent
-    if str(src_dir) not in sys.path:
-        sys.path.insert(0, str(src_dir))
-    from normalize import ADDRESS_ABBREV_MAP
-
-    result = series.fillna("").str.lower()
-    result = result.str.replace("&", " and ", regex=False)
-    result = result.str.replace(
-        r"\b(?:[a-z]\.){2,}",
-        lambda m: m.group(0).replace(".", ""),
-        regex=True,
-        case=False,
-    )
-    result = result.str.replace(r"[^\w\s\-]", " ", regex=True)
-    result = result.str.replace(r"\s+", " ", regex=True).str.strip()
-
-    for key in sorted(ADDRESS_ABBREV_MAP.keys(), key=len, reverse=True):
-        pattern = r"(?<!\w)" + _re.escape(key) + r"(?![\w-])"
-        result = result.str.replace(pattern, ADDRESS_ABBREV_MAP[key], regex=True, case=False)
-
-    result = result.str.replace(r"\s+", " ", regex=True).str.strip()
-    return result
-
-
 def _ensure_normalized_files(split: str) -> Dict[str, Path]:
     """
-    Check if normalized TSVs exist; if not, run vectorized normalization.
+    Check if normalized TSVs exist; fail loudly if missing.
     Returns dict of {source_key: norm_path}.
     """
-    raw_dir = RAW_TRAIN_DIR if split == "train" else RAW_TEST_DIR
     sources = {}
+    missing = []
 
     for src_num in [1, 2, 3]:
-        raw_file = raw_dir / f"{split}_source{src_num}.tsv"
         norm_file = NORM_DIR / f"{split}_source{src_num}_normalized.tsv"
         sources[f"S{src_num}"] = norm_file
 
         if norm_file.exists():
             print(f"  [norm] Found: {norm_file.name}")
-            continue
+        else:
+            missing.append(norm_file.name)
 
-        print(f"  [norm] Normalizing {raw_file.name} → {norm_file.name} ...")
-        t0 = time.time()
-        NORM_DIR.mkdir(parents=True, exist_ok=True)
-
-        first_chunk = True
-        total_rows = 0
-        for chunk in pd.read_csv(raw_file, sep="\t", dtype=str, chunksize=300_000):
-            chunk = chunk.fillna("")
-            chunk["raw_business_name"] = chunk["business_name"]
-            chunk["normalized_business_name"] = _vectorized_normalize_names(chunk["business_name"])
-            chunk["business_name_tokens"] = chunk["normalized_business_name"]
-            chunk["raw_business_address"] = chunk["business_address"]
-            chunk["normalized_business_address"] = _vectorized_normalize_addresses(chunk["business_address"])
-            for col in ["landmark", "city", "state", "postal_code"]:
-                if col not in chunk.columns:
-                    chunk[col] = ""
-
-            out_cols = [
-                "entity_id", "country",
-                "raw_business_name", "normalized_business_name", "business_name_tokens",
-                "raw_business_address", "normalized_business_address",
-                "landmark", "city", "state", "postal_code",
-            ]
-            out_chunk = chunk[[c for c in out_cols if c in chunk.columns]]
-            out_chunk.to_csv(
-                norm_file, sep="\t", index=False,
-                mode="w" if first_chunk else "a",
-                header=first_chunk,
-            )
-            first_chunk = False
-            total_rows += len(chunk)
-
-        elapsed = time.time() - t0
-        print(f"    → {total_rows:,} rows normalized in {elapsed:.1f}s")
-        gc.collect()
+    if missing:
+        raise FileNotFoundError(
+            f"Normalized files not found for split '{split}': {', '.join(missing)}. "
+            f"Run normalize.py first to generate data/normalized/{{train,test}}_source{{1,2,3}}_normalized.tsv"
+        )
 
     return sources
 

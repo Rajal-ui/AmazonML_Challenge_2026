@@ -12,3 +12,5 @@ __pycache__/
 # OS / logs
 .DS_Store
 *.log
+
+docs/
