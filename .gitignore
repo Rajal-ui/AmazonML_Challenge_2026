@@ -1,0 +1,14 @@
+# Large data - kept on disk, never committed (GitHub 100MB file limit)
+dataset/
+
+# Generated normalization outputs
+code/business_entity_resolution/data/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# OS / logs
+.DS_Store
+*.log
