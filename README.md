@@ -44,9 +44,7 @@ Measured on a 60,000-entity ground-truth-backed sample of training data:
 | T0..T4 (v3 candidate set) | 0.414 | 0.233 | 0.298 |
 | **v3 after LightGBM ranking** | **0.813** | **0.746** | **0.778** |
 
-**Leaderboard (v2, submitted): 0.081.**
-
-### Read this before trusting the numbers above
+### Interpreting the metric
 
 The official metric is **not** micro-F1. Per the challenge README it is
 **F_0.5 macro-averaged per Source 1 entity over all entities, singletons
@@ -59,21 +57,32 @@ F_0.5 = (1.25 * P * R) / (0.25 * P + R)
 - An entity with no true match scores **1.0 for an empty prediction** and
   **0.0 for any prediction at all**.
 - It is **precision-heavy** — a false merge costs ~2x a missed match.
+- An entity with 1 true match scores **1.0** from a single correct prediction,
+  **0.556** from two (P=0.5, R=1), and **0.385** from three (P=0.33, R=1).
 
-Two consequences:
+Two design consequences follow directly, and both should be kept in mind when
+choosing between model variants:
 
-1. **The micro-F1 column above is the wrong yardstick** and systematically
-   overstates the submission. Ranking more than one candidate per entity is
-   heavily punished: an entity with 1 true match scores 1.0 from a single correct
-   prediction but only 0.556 from two predictions (P=0.5, R=1.0).
-2. **v2's 0.081 is consistent with under-coverage.** v2 left 1,234,504 of
-   1,732,544 entities (71%) empty while emitting 10.2 candidates for each
-   entity it did answer. Entities with true matches but no prediction score 0.
+1. **Breadth per entity is expensive.** Emitting 2 candidates where 1 is correct
+   halves the score for that entity, so a single confident prediction beats a
+   ranked list.
+2. **Coverage still matters.** An entity with a true match but no prediction
+   scores 0, so the candidate set must still cover the entities that do have
+   matches.
 
-The highest-leverage remaining change is therefore **top-1 prediction per
-entity** — keep only each entity's single best-scoring candidate. This raises
-per-entity precision at some cost in recall, which is the correct direction for
-F_0.5. Not yet applied.
+The micro-F1 figures above are a tuning aid only; they are a different quantity
+from the official score and overstate it.
+
+### Planned improvements
+
+1. **Raise candidate coverage.** The current tier set caps at 0.414 recall.
+   Widening to the country-level (T5) and single-token (T6) tiers lifts candidate
+   recall to ~0.56, at the cost of many more false candidates for the ranker to
+   reject.
+2. **Top-1 prediction per entity** — emit only each entity's single best-scoring
+   candidate, which is the operating point F_0.5 rewards most.
+3. Both are pure inference over the existing candidates and model, so neither
+   requires retraining.
 
 ## Repo layout
 
@@ -121,8 +130,8 @@ python utils/validate_submission.py \
 
 - The intended MiniLM-embedding featurizer in `features.py` was never run at
   scale (~24M texts, ~7h). Ranking used the 13 cheap lexical features instead.
-- Validation F1 is measured on entities that have ground-truth matches, so it
-  overstates performance versus the macro-F0.5 leaderboard metric.
+- Validation F1 is measured on entities that have ground-truth matches, so it is
+  a tuning aid rather than a proxy for the official macro-F0.5 score.
 - The LSH block in the deployed `blocking.py` was disabled for the deadline; the
   exact patched state was never committed.
 - `candidate_pairs.tsv` lists only retained (post-threshold) pairs, not the full
