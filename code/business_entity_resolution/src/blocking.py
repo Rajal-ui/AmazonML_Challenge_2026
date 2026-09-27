@@ -62,14 +62,9 @@ EMBEDDING_DIM: int = 384               # all-MiniLM-L6-v2 output dim
 
 # ─── Path Configuration ──────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]  # AmazonML_Challenge_2026
-DATA_DIR = PROJECT_ROOT / "code" / "business_entity_resolution" / "data"
-NORM_DIR = DATA_DIR / "normalized"
-CAND_DIR = DATA_DIR / "candidates"
-CACHE_DIR = DATA_DIR / "cache"
-RAW_TRAIN_DIR = PROJECT_ROOT / "dataset" / "train"
-RAW_TEST_DIR = PROJECT_ROOT / "dataset" / "test"
-GROUND_TRUTH_PATH = RAW_TRAIN_DIR / "train_ground_truth.tsv"
+from config import NORM_DIR, CAND_DIR, CACHE_DIR, GROUND_TRUTH  # noqa: E402
+
+GROUND_TRUTH_PATH = GROUND_TRUTH  # kept: name used by main() below
 
 
 def _ensure_normalized_files(split: str) -> Dict[str, Path]:
