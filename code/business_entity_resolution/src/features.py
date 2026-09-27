@@ -22,12 +22,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DATA_DIR = PROJECT_ROOT / "code" / "business_entity_resolution" / "data"
-NORM_DIR = DATA_DIR / "normalized"
-CAND_DIR = DATA_DIR / "candidates"
-CACHE_DIR = DATA_DIR / "cache"
-MODELS_DIR = PROJECT_ROOT / "code" / "business_entity_resolution" / "models"
+from config import NORM_DIR, CAND_DIR, CACHE_DIR  # noqa: E402
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384

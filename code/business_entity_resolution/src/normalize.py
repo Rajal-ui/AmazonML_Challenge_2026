@@ -8,10 +8,14 @@ to enable consistent entity resolution across multiple data sources.
 import re
 import string
 import time
+import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Any
 
 import pandas as pd
+
+import config
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -361,7 +365,64 @@ STREET_TYPES: Set[str] = {
     "drive", "dr", "lane", "ln", "court", "ct", "place", "pl", "parkway",
     "pkwy", "circle", "cir", "trail", "trl", "highway", "hwy", "expressway",
     "expy", "way", "close", "crescent", "terrace", "square", "row", "route",
+    # French street types. Needed because _extract_city runs on the text BEFORE
+    # abbreviation expansion, so both the abbreviation and the full word must be
+    # listed. Measured on 209k France rows: 'rue' appears in 65.8% of addresses
+    # and was being returned as the city for 17,108 of them.
+    "rue", "bd", "impasse", "chemin", "allee", "quai", "cours", "passage",
+    "ruelle", "sentier", "voie", "esplanade", "faubourg", "hameau", "villa",
+    "lotissement", "rond", "parvis", "promenade", "traverse",
 }
+
+
+# French administrative divisions (regions + departments) must never be taken as
+# a city. On this dataset they dominate the trailing comma-part of a French
+# address, so before this list existed ~52% of the 1.69M French rows stored
+# 'hauts-de-france' / 'nord' / 'gironde' as their city - a near-constant value
+# that carries no discriminative signal for blocking.
+#
+# Matching is on the whole candidate string, so a city that merely contains a
+# division name is unaffected: 'calais' stays a city even though the department
+# is 'pas-de-calais'.
+#
+# 'paris' is deliberately absent: it is both the department (75) and France's
+# largest city, and rejecting it erased the city from every Paris address.
+# Every other entry is a division with no major city of the same name.
+FRENCH_REGIONS: Set[str] = {
+    "auvergne-rhone-alpes", "auvergne rhone alpes", "borgogne-franche-comte",
+    "bretagne", "centre-val de loire", "centre val de loire", "corse",
+    "grand-est", "grand est", "hauts-de-france", "ile-de-france", "ile de france",
+    "normandie", "nouvelle-aquitaine", "occitanie", "pays de la loire",
+    "provence-alpes-cote d'azur", "provence alpes cote d azur",
+    # pre-2016 region names, still present in older address data
+    "aquitaine", "auvergne", "basse-normandie", "champagne-ardenne",
+    "franche-comte", "haute-normandie", "languedoc-roussillon", "lorraine",
+    "midi-pyrenees", "picardie", "poitou-charentes", "rhone-alpes",
+    # overseas regions / departments
+    "guadeloupe", "guyane", "la reunion", "martinique", "mayotte",
+}
+
+FRENCH_DEPARTMENTS: Set[str] = {
+    "ain", "aisne", "allier", "alpes-de-haute-provence", "hautes-alpes",
+    "alpes-maritimes", "ardèche", "ardennes", "ariège", "aube", "aude", "aveyron",
+    "bouches-du-rhone", "calvados", "cantal", "charente", "charente-maritime",
+    "cher", "corrèze", "corse-du-sud", "haute-corse", "côte-d'or", "cotes-d'armor",
+    "creuse", "dordogne", "doubs", "drôme", "eure", "eure-et-loir", "finistère",
+    "gard", "haute-garonne", "gers", "gironde", "hérault", "ille-et-vilaine",
+    "indre", "indre-et-loire", "isère", "jura", "landes", "loir-et-cher", "loire",
+    "haute-loire", "loire-atlantique", "loiret", "lot", "lot-et-garonne", "lozère",
+    "maine-et-loire", "manche", "marne", "haute-marne", "mayenne",
+    "meurthe-et-moselle", "meuse", "morbihan", "moselle", "nièvre", "nord", "oise",
+    "orne", "pas-de-calais", "puy-de-dôme", "pyrénees-atlantiques",
+    "hautes-pyrénées", "pyrénees-orientales", "bas-rhin", "haut-rhin", "rhône",
+    "haute-saône", "saône-et-loire", "sarthe", "savoie", "haute-savoie",
+    "seine-maritime", "seine-et-marne", "yvelines", "deux-sèvres", "somme",
+    "tarn", "tarn-et-garonne", "var", "vaucluse", "vendée", "vienne",
+    "haute-vienne", "vosges", "yonne", "territoire de belfort", "essonne",
+    "hauts-de-seine", "seine-saint-denis", "val-de-marne", "val-d'oise",
+}
+
+_ADMIN_DIVISIONS: Set[str] = FRENCH_REGIONS | FRENCH_DEPARTMENTS
 
 
 # ─── Precompiled Patterns ─────────────────────────────────────────────────────
@@ -375,6 +436,49 @@ _STRIP_COMMA_RE = re.compile(r"[^\w\s\-,]")
 _STRIP_RE = re.compile(r"[^\w\s\-]")
 _DIGITS_RE = re.compile(r"\d+")
 _ORPHAN_HYPHEN_RE = re.compile(r"(?:(?<=\s)-|-(?=\s))")
+_NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
+
+
+@lru_cache(maxsize=1)
+def _unicode_mark_class() -> str:
+    """Regex character-class body covering every Unicode mark (category M).
+
+    Python's ``\\w`` does not match category-M codepoints, so a negated class
+    like ``[^\\w\\s\\-]`` silently deletes Indic matras, viramas and Arabic
+    harakat. ``re`` has no ``\\p{M}``, so the mark ranges are derived once from
+    the ``unicodedata`` tables and cached for the process lifetime.
+    """
+    ranges: List[tuple] = []
+    start: Optional[int] = None
+    for cp in range(0x110000):
+        if unicodedata.category(chr(cp)).startswith("M"):
+            if start is None:
+                start = cp
+        elif start is not None:
+            ranges.append((start, cp - 1))
+            start = None
+    if start is not None:
+        ranges.append((start, 0x10FFFF))
+    body = []
+    for lo, hi in ranges:
+        body.append(re.escape(chr(lo)) if lo == hi
+                    else f"{re.escape(chr(lo))}-{re.escape(chr(hi))}")
+    return "".join(body)
+
+
+@lru_cache(maxsize=2)
+def _strip_pattern(preserve_commas: bool):
+    """Punctuation-strip pattern that also preserves Unicode marks.
+
+    Compiled lazily because building the mark class walks the whole code space
+    once; ASCII-only input never triggers it (see ``_strip_punctuation``).
+    """
+    keep = "\\w\\s\\-" + ("," if preserve_commas else "")
+    # No separator is inserted before the mark body on purpose: every keep char
+    # above is either a class escape (\w, \s) or an escaped literal (\-), so the
+    # body's leading range cannot be absorbed into one. A bare ',' here would be
+    # a literal inside the class and would silently keep every comma.
+    return re.compile("[^" + keep + _unicode_mark_class() + "]")
 
 _LANDMARK_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(k) for k in sorted(LANDMARK_KEYWORDS, key=len, reverse=True))
@@ -420,13 +524,19 @@ def _strip_punctuation(text: str, preserve_commas: bool = False) -> str:
     - '&' becomes 'and' (otherwise it is deleted entirely)
     - dotted single-letter initialisms ('l.l.c.', 's.a.', 'p.o.') are merged
       so they stay matchable by the suffix/abbreviation maps
+
+    Unicode marks (category M - Indic matras and viramas, Arabic harakat) are
+    kept, because Python's ``\\w`` excludes them and a plain ``[^\\w\\s]`` class
+    deletes them outright, shattering 'प्राइवेट' into 'प र इव ट'. Input is
+    NFC-normalized first so canonically equivalent spellings agree.
     """
     text = text.replace("&", " and ")
     text = _DOTTED_INITIALISM_RE.sub(lambda m: m.group(0).replace(".", ""), text)
-    if preserve_commas:
-        return _STRIP_COMMA_RE.sub(" ", text)
-    # Keep alphanumeric, spaces, and some useful chars like hyphens in numbers
-    return _STRIP_RE.sub(" ", text)
+    if text.isascii():
+        # Fast path: no marks exist in pure ASCII, so the class is identical.
+        return (_STRIP_COMMA_RE if preserve_commas else _STRIP_RE).sub(" ", text)
+    text = unicodedata.normalize("NFC", text)
+    return _strip_pattern(preserve_commas).sub(" ", text)
 
 
 def _tokenize(text: str) -> List[str]:
@@ -511,8 +621,26 @@ def _extract_postal_code(text: str, country: Optional[str] = None) -> Optional[s
     return None
 
 
-def _extract_state(text: str) -> Optional[str]:
+def _extract_french_region(text: str) -> Optional[str]:
+    """Return the French region/department acting as the state, if present.
+
+    French rows have no US-style state code, so the code-based passes must not
+    run for them: 'la' in "La Teste-de-Buch" matched Louisiana, and 'or'/'ca'/
+    'in' match ordinary French words. Returning the real division instead gives
+    _extract_city the anchor it needs to prefer the city over the region.
+    """
+    for part in text.split(","):
+        candidate = part.strip()
+        if candidate and _is_admin_division(candidate):
+            return candidate.lower()
+    return None
+
+
+def _extract_state(text: str, country: Optional[str] = None) -> Optional[str]:
     """Extract state/region from text."""
+    if (country or "").strip().lower().startswith("france"):
+        return _extract_french_region(text)
+
     # First try full state names (more reliable), skipping names that are
     # really street names ("2213 Michigan Street" -> not the state of Michigan)
     for match in _FULL_STATE_RE.finditer(text):
@@ -549,6 +677,9 @@ JUNK_PART_TOKENS: Set[str] = {
     "block", "phase", "sector", "colony", "typ", "kh", "blk", "sec", "ph",
     "cross", "main", "house", "building", "gali", "mohalla", "nagar", "chowk",
     "tower", "circle", "complex", "market", "centre", "center",
+    # French unit / building descriptors, which otherwise become the city
+    "residence", "appartement", "batiment", "etage", "rez", "za", "zi", "zac",
+    "lieu", "dit", "immUBLE", "local", "atelier",
 }
 
 
@@ -566,11 +697,24 @@ def _is_meaningful_part(text: str) -> bool:
 
 
 def _looks_like_street(text: str) -> bool:
-    """True if the part ends with (or near-ends with) a street-type word."""
+    """True if any token is a street-type word, i.e. the part is a street line.
+
+    A single whole-part check covers both placements seen in the data: the
+    street word trailing the name ('rue de foo', 'avenue de dunkerque',
+    '5 bis rue pierre dignac') and leading it ('bd du president wilson'). An
+    earlier version inspected only the last two or three tokens, which let
+    'rue' through for 17,108 of 60k French rows.
+    """
     tokens = text.split()
     if not tokens:
         return False
-    return any(tok in STREET_TYPES for tok in tokens[-2:])
+    return any(tok in STREET_TYPES for tok in tokens)
+
+
+@lru_cache(maxsize=512)
+def _trailing_state_code_re(state: str) -> re.Pattern:
+    """Matches ' <state-code>' at the end of a candidate, cached per state."""
+    return re.compile(r"\s+\b" + re.escape(state) + r"$", re.IGNORECASE)
 
 
 def _clean_city_candidate(
@@ -579,11 +723,13 @@ def _clean_city_candidate(
     postal: Optional[str] = None,
     country: Optional[str] = None,
 ) -> str:
-    """Strip postal code, digits and dangling hyphens from a candidate part.
+    """Strip postal code, digits, dangling hyphens and a trailing state code.
 
-    The state/country are only dropped when the candidate IS exactly them -
-    never when they are embedded, since cities like "central delhi" or
-    "hauts-de-france" legitimately contain those words.
+    A full state/country name is only dropped when the candidate IS exactly it,
+    never when embedded, since cities like "central delhi" or "michigan city"
+    legitimately contain those words. A trailing two-letter state code is the
+    exception: the code never belongs to a city name, so "austin tx" is trimmed
+    to "austin" rather than being kept as a second spelling of the same city.
     """
     out = part
     if postal:
@@ -591,11 +737,34 @@ def _clean_city_candidate(
     out = _DIGITS_RE.sub(" ", out)
     out = _ORPHAN_HYPHEN_RE.sub(" ", out)
     out = _normalize_whitespace(out).strip(" -")
+    if state and len(state) == 2:
+        match = _trailing_state_code_re(state).search(out)
+        if match and match.start() > 0:
+            out = out[:match.start()].strip()
     if state and out.lower() == state.lower():
         return ""
     if country and out.lower() == country.lower():
         return ""
     return out
+
+
+def _fold_admin_key(text: str) -> str:
+    """Accent- and punctuation-insensitive key for admin-division comparison.
+
+    Lets 'côte-d'or', "cote d'or" and 'Cote d Or' all resolve to one entry.
+    """
+    decomposed = unicodedata.normalize("NFKD", text.lower())
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return _NON_ALNUM_RE.sub(" ", stripped).strip()
+
+
+@lru_cache(maxsize=300_000)
+def _is_admin_division(candidate: str) -> bool:
+    """True if the candidate is a French region or department, not a city."""
+    return _fold_admin_key(candidate) in _ADMIN_DIVISION_KEYS
+
+
+_ADMIN_DIVISION_KEYS: Set[str] = {_fold_admin_key(a) for a in _ADMIN_DIVISIONS}
 
 
 def _extract_city(
@@ -617,13 +786,16 @@ def _extract_city(
        state-first prefixes ("West Bengal, ... Calcutta, Kolkata").
     4. With no state at all, take the last valid part.
 
-    Street lines, bare numbers, address fragments and the state/country
-    itself are never returned.
+    Street lines, bare numbers, address fragments, the state/country itself and
+    French regions/departments are never returned; skipping an admin division
+    keeps scanning, so "... Lille, Hauts-de-France" still yields "lille".
     """
     parts = [p.strip() for p in text.split(",") if p.strip()]
 
     def valid(candidate: str) -> bool:
-        return bool(candidate) and _is_meaningful_part(candidate) and not _looks_like_street(candidate)
+        if not candidate or not _is_meaningful_part(candidate) or _looks_like_street(candidate):
+            return False
+        return not _is_admin_division(candidate)
 
     def state_re(s: str) -> re.Pattern:
         compiled = _STATE_IN_PART_CACHE.get(s)
@@ -641,10 +813,13 @@ def _extract_city(
         last_state_idx = state_indices[-1]
         last_state_part = parts[last_state_idx].strip()
 
-        # "new delhi" / "austin tx" - the part is city (+state)
+        # "new delhi" / "austin tx" - the part is city (+state). Cleaned like
+        # every other candidate so a trailing postal code or state code cannot
+        # survive into the city field.
         if last_state_part.lower() != state.lower() and state_re(state).search(last_state_part):
-            if valid(last_state_part):
-                return last_state_part
+            candidate = _clean_city_candidate(last_state_part, state, postal, country)
+            if valid(candidate):
+                return candidate
 
         for j in range(last_state_idx - 1, -1, -1):
             candidate = _clean_city_candidate(parts[j], state, postal, country)
@@ -777,7 +952,7 @@ def normalize_address(raw_address: str, country: Optional[str] = None) -> Dict[s
 
     # Step 4: Extract components from the landmark-free core
     postal_code = _extract_postal_code(core_for_extraction, country)
-    state = _extract_state(core_for_extraction)
+    state = _extract_state(core_for_extraction, country)
     city = _extract_city(core_for_extraction, state, postal_code, country)
 
     # Step 5: Build the normalized address from the same core text
@@ -921,8 +1096,8 @@ def _print_rows(title: str, df: pd.DataFrame) -> None:
 
 def main():
     """Main entry point: normalize all six source files (ground truth excluded)."""
-    base_input = Path("dataset")
-    base_output = Path("code/business_entity_resolution/data/normalized")
+    base_input = config.DATA_RAW
+    base_output = config.NORM_DIR
 
     files_to_process = [
         ("train/train_source1.tsv", "train_source1_normalized.tsv"),

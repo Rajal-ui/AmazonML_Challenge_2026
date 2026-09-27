@@ -4,6 +4,24 @@ dataset/
 # Generated normalization outputs
 code/business_entity_resolution/data/
 
+# Generated submission artifacts (reproducible; canonical copies live in S3)
+submission/
+submission_v2/
+submission_v3/
+
+# AWS account identifiers / scratch
+.aws_bucket_name.txt
+.aws_instance_id.txt
+permissions-policy.json
+trust-policy.json
+
+# One-off SSM invocation scratch (regenerable shell payloads)
+ssm_*_cmd.json
+ssm_hello_cmd.json
+ssm_test_cmd.json
+ssm_test_import.json
+ssm_test.ps1
+
 # Python
 .venv/
 __pycache__/
